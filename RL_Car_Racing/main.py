@@ -16,8 +16,8 @@ import argparse
 import gymnasium as gym
 
 import utils
-from models.dqn import DQNAgent
-from models.ddqn import DDQNAgent
+from .models.dqn import DQNAgent
+from .models.ddqn import DDQNAgent
 
 
 def main(experiment: dict, debug: bool)->None:

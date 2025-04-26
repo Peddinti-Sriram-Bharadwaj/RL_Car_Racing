@@ -1,4 +1,4 @@
-from dqn import DQNAgent, QNetwork
+from .dqn import DQNAgent, QNetwork
 import gymnasium as gym
 import torch
 import numpy as np
