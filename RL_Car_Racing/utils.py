@@ -15,36 +15,32 @@
 import gymnasium as gym
 import os, torch, wandb, yaml
 from typing import Dict, Optional
+import numpy as np
 
 
 class WandBLogger:
     def __init__(self, experiment: dict, project_name: str="RL_Car_Racing"):
         """
-        A helper class to handle WandB related functionalities. 
-        
-        Key behaviors include: creating a wandb log, tracking individual numbers, 
-        tracking statistics over an episode, and sending the log out when requested. 
-        
-        Args:
-            experiment (dict): A high level dictionary that define an experiment
-            project_name (str, optional): The name for the WandB project. Defaults to "RL_Car_Racing".
+        A helper class to handle WandB related functionalities.
+        # ... (rest of docstring) ...
         """
         self.stats: Dict[str, float] = {
                     "eps": 0.,
                     "tot_steps": 0.,
-                    "epi_avg_rets": 0.,
-                    "epi_tot_rets": 0.,
-                    "epi_avg_q": 0.,
-                    "epi_avg_loss": 0.,
-                    "tiles_visited": 0.,
-                    "eval_tiles_visited": 0.
+                    "epi_avg_rets": 0., # Average return per step in the episode
+                    "epi_tot_rets": 0., # Total return for the episode
+                    "epi_avg_q": 0.,    # Average Q value during the episode
+                    "epi_avg_loss": 0., # Average loss during the episode
+                    "tiles_visited": 0., # Max tiles visited during training
+                    "eval_tiles_visited": 0., # Tiles visited during evaluation
+                    "eval_episode_reward": 0. # <-- ADD THIS KEY
         }
         self.epi_stats: Dict[str, list] = {
-                    "returns": [],
-                    "q_values": [],
-                    "losses": []
+                    "returns": [], # List of rewards per step
+                    "q_values": [], # List of Q values per training step
+                    "losses": []    # List of losses per training step
         }
-        
+
         wandb.login()
         self.run = wandb.init(project=project_name,
                         name = experiment['name'],
@@ -168,34 +164,60 @@ def parse_config(path: str)->dict:
         return config_dict
     
     
-def wrap_env(env: gym.Env, experiment_name: str, split: str="train", record_t: int=1)->gym.Env:
-    """ Wrap an environment with given wrappers from the Gymnasium library. See 
-    https://gymnasium.farama.org/api/wrappers/table/ for a list of wrappers given. 
-    
-    At minimum, the environment will record every 'record_t' episodes. 
-    
+# /Users/srirambharadwaj/Documents/iiitb/sem2/RL/RL_Car_Racing/RL_Car_Racing/utils.py
+
+# ... (other imports and classes) ...
+
+def wrap_env(env: gym.Env, experiment_name: str, split: str = "train", record_t: int = 1) -> gym.Env:
+    """
+    Wrap an environment with grayscale, stacking, tensor conversion, cropping,
+    and optional video recording.
+
     Args:
-        env (gymnasium.Env): A gymnasium environment. 
-        experiment_name (str): The name to save the recoded videos that are trigger
-        split (str): If multiple env are being made, create a new split
-        record_t (int): If not provided, save each time the env is reset. Useful for evaluation. 
-            Defaults to 1.
+        env (gym.Env): The Gymnasium environment.
+        experiment_name (str): Experiment name for video saving.
+        split (str): "train" or "test" split.
+        record_t (int): Frequency of recording episodes (0 disables recording).
 
     Returns:
-        gymnasium.Env: A wrapped environment
+        gym.Env: Wrapped environment.
     """
-    
-    # place wrapper class calls here
+
+    # Convert to grayscale
     env = gym.wrappers.GrayscaleObservation(env, keep_dim=False)
+
+    # Stack frames
     env = gym.wrappers.FrameStackObservation(env, stack_size=4)
-    env = gym.wrappers.TransformObservation(env, lambda x: torch.tensor(x).float(), env.observation_space)
-    env = gym.wrappers.TransformObservation(env, lambda x: x[:, :84, :84], env.observation_space)
-    # place wrapper class calls here
-    
-    env = gym.wrappers.RecordVideo(env, video_folder=f"./videos/{experiment_name}/{split}/", episode_trigger=lambda t: t % record_t == 0, 
-                    disable_logger=True)
-    
+
+    # Convert LazyFrames to torch tensor
+    env = gym.wrappers.TransformObservation(
+        env,
+        lambda x: torch.tensor(np.array(x), dtype=torch.float32),
+        observation_space=None  # Let it auto-infer
+    )
+
+    # Crop the tensor
+    env = gym.wrappers.TransformObservation(
+        env,
+        lambda x: x[:, :84, :84],
+        observation_space=None
+    )
+
+    # Record video if needed
+    if record_t > 0 and getattr(env, "render_mode", None) != 'human':
+        def custom_episode_trigger(episode_id):
+            return episode_id % record_t == 0
+
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=f"./videos/{experiment_name}/{split}/",
+            episode_trigger=custom_episode_trigger,
+            disable_logger=True
+        )
+
     return env
+
+
 
 
 
