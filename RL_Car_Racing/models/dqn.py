@@ -3,13 +3,7 @@
 # Created by: Alec Trela
 # GitHub: https://github.com/artrela
 # Description: Classes related to a DQN RL agent
-#
-# This is included as a part of the MRSD bootcamp, meant to be a primer for students
-# entering their first year of the program at Carnegie Mellon University
-#
-# Feel free to use, modify, and share this file. Attribution is appreciated!
-# For more information, visit my GitHub or
-# https://github.com/RoboticsKnowledgebase/mrsd-software-bootcamp.
+# ... (rest of header) ...
 # ==============================================================================
 
 from collections import namedtuple, deque
@@ -109,7 +103,7 @@ class DQNAgent():
 
 
         # --- Hyperparameters and Other Attributes ---
-        params = experiment['params']
+        params = experiment['params'] # Use the potentially modified params dict
         self.current_episode:int = 0
         self.total_steps: int = 0 # Start total steps at 0
         self.training_steps: int = 0 # Track training updates
@@ -117,12 +111,13 @@ class DQNAgent():
         self.episode_decay: int = params.get('episode_decay', 1000) # Episodes over which epsilon decays
         self.network_update: int = params.get('step_update', 4) # Env steps between training updates
         self.target_update_freq: int = params.get('target_update', 1000) # Training steps between target net updates
-        self.epsilon_final: float = params.get('epsilon', 0.01) # Final epsilon value (used in decay calc)
-        self.epsilon: float = 1.0 # Starting epsilon value
+        self.epsilon_final: float = params.get('epsilon_final', 0.02) # Use epsilon_final from config
+        self.epsilon: float = params.get('epsilon', 1.0) # Use epsilon from config as starting value
         # Calculate decay rate based on episode_decay (linear decay)
         if self.episode_decay <= 0:
              self.epsilon_decay_rate = 0.0 # No decay if episode_decay is non-positive
         else:
+             # Decay from starting epsilon down to final epsilon
              self.epsilon_decay_rate = (self.epsilon - self.epsilon_final) / self.episode_decay
 
         self.gamma: float = params.get('gamma', 0.99)
@@ -130,7 +125,15 @@ class DQNAgent():
         self.batch_size:int = params.get('batch_size', 32)
         self.seed: int = params.get('random_seed', -1) # -1 might mean no fixed seed
         self.exp_replay = ExperienceReplay(params.get('mem_len', 50000))
-        # self.action_space = ACTION_SPACE # Already defined above
+
+        # --- Cost/Penalty Hyperparameters (Read from params) ---
+        self.use_cost_penalty: bool = params.get('use_cost_penalty', False) # Get flag set by main.py
+        self.cost_reward_threshold: float = params.get('cost_reward_threshold', -0.1)
+        self.cost_penalty_coefficient: float = params.get('cost_penalty_coefficient', 1.0)
+        if self.use_cost_penalty:
+             print(f"INFO: Agent using cost penalty with threshold={self.cost_reward_threshold}, coeff={self.cost_penalty_coefficient}")
+        # --- Cost/Penalty Hyperparameters ---
+
         self.episode_actions = [0 for _ in range(num_actions)]
         # --- Hyperparameters and Other Attributes ---
 
@@ -146,7 +149,7 @@ class DQNAgent():
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
-        loss_name = params.get('loss', 'MSE')
+        loss_name = params.get('loss', 'Huber') # Changed default to Huber
         if loss_name.lower() == 'mse':
             self.loss_fn = torch.nn.MSELoss()
         elif loss_name.lower() == 'huber':
@@ -166,24 +169,12 @@ class DQNAgent():
 
 
     def __call__(self, s0: torch.Tensor, a0: int, r0: float, s1: torch.Tensor, t: bool)->int:
-        """ Handles storing experience, triggering training, and selecting the next action.
-
-        Args:
-            s0 (torch.Tensor): The previous observation (on device).
-            a0 (int): The action index taken.
-            r0 (float): The reward received.
-            s1 (torch.Tensor): The resulting observation (on device).
-            t (bool): Was a terminal state reached (terminated or truncated).
-
-        Returns:
-            int: The index of the next action to take.
-        """
-        # Store experience (move tensors to CPU for storage if needed)
+        """ Handles storing experience, triggering training, and selecting the next action. """
+        # Store experience
         s0_cpu = s0.cpu() if s0.is_cuda else s0
         s1_cpu = s1.cpu() if s1.is_cuda else s1
         self.exp_replay.storeExperience(s0_cpu, a0, r0, s1_cpu, t)
 
-        # Increment total environment steps *after* storing experience
         self.total_steps += 1
 
         # Check if ready to train
@@ -192,17 +183,29 @@ class DQNAgent():
             experiences = self.exp_replay.getRandomExperiences(self.batch_size)
             states, actions, rewards, next_states, terminals = self._prepareMinibatch(experiences)
 
-            # Calculate target Q-values using the target network (Standard DQN)
+            # --- Calculate Cost based on reward threshold ---
+            costs = (rewards < self.cost_reward_threshold).float() * self.cost_penalty_coefficient
+            # --- Calculate Cost based on reward threshold ---
+
+            # --- Calculate Augmented Reward if penalty is enabled ---
+            if self.use_cost_penalty:
+                augmented_rewards = rewards - costs
+            else:
+                augmented_rewards = rewards
+            # --- Calculate Augmented Reward ---
+
+
+            # Calculate target Q-values using the target network
             with torch.no_grad():
                  q_values_next_target = self.target_net(next_states)
                  max_q_next, _ = q_values_next_target.max(dim=1)
-                 # Target is reward if terminal, otherwise reward + discounted max future Q
-                 target_q_values = rewards + self.gamma * max_q_next * (~terminals) # Use boolean negation
+                 # --- Use augmented_rewards in target calculation ---
+                 target_q_values = augmented_rewards + self.gamma * max_q_next * (~terminals) # Use boolean negation
+                 # --- Use augmented_rewards in target calculation ---
 
-            # Get current Q-values from policy network for the actions taken
-            self.q_net.train() # Ensure policy net is in training mode
+            # Get current Q-values from policy network
+            self.q_net.train()
             current_q_values_all = self.q_net(states)
-            # Gather Q-values corresponding to the actions taken in the batch
             current_q_values = current_q_values_all.gather(1, actions.unsqueeze(1)).squeeze(1)
 
             # Calculate loss
@@ -212,37 +215,32 @@ class DQNAgent():
             # Optimize the model
             self.optim.zero_grad()
             loss_tensor.backward()
-            # Optional: Gradient clipping
-            # torch.nn.utils.clip_grad_value_(self.q_net.parameters(), 1.0) # Example value
             self.optim.step()
 
             self.training_steps += 1
 
-            # Update target network periodically based on training steps
+            # Update target network periodically
             if self.training_steps % self.target_update_freq == 0:
                 print(f"--- Updating target network at training step {self.training_steps} ---")
                 self.target_net.load_state_dict(self.q_net.state_dict())
 
-            # Log step-level stats if logger exists
+            # Log step-level stats
             if self.logger:
                 self.logger.trackStatistic("losses", loss)
                 self.logger.trackStatistic("q_values", current_q_values.mean().item())
 
-            # Optional: Clean up GPU memory
-            # del states, actions, rewards, next_states, terminals, target_q_values, current_q_values_all, current_q_values, loss_tensor
-            # gc.collect()
-            # if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-        # Log return for the step
+        # Log raw return for the step (for episode total calculation)
         if self.logger:
             self.logger.trackStatistic('returns', r0)
 
-        # Select the next action based on the *new* state (s1)
-        next_action = self.selectAction(state=s1) # Pass the next state
+        # Select the next action based on the new state (s1)
+        next_action = self.selectAction(state=s1)
 
-        # Epsilon decay (can be done per step or per episode)
-        # Doing it per step here
-        self._epsilonDecay()
+        # Epsilon decay (based on episodes)
+        # Note: Decay happens even if no training step occurred, based on episode progress
+        # This is called within _trackProgress when episode ends
+        # self._epsilonDecay() # Moved decay logic to _trackProgress based on episodes
 
         # Track progress (updates step counts, logs episode stats if 't' is True)
         self._trackProgress(t)
@@ -251,11 +249,7 @@ class DQNAgent():
 
 
     def fillMemory(self, num_steps: Optional[int] = None):
-        """ Fills the replay memory with experiences from random actions.
-
-        Args:
-            num_steps (Optional[int]): Number of random steps to take. Defaults to batch_size.
-        """
+        """ Fills the replay memory with experiences from random actions. """
         if num_steps is None:
             num_steps = self.batch_size
         if len(self.exp_replay) >= num_steps:
@@ -263,10 +257,8 @@ class DQNAgent():
              return
 
         print(f"Filling replay memory with (up to) {num_steps} random steps...")
-        # Use a temporary seed for filling if main seed is set, otherwise use None
         fill_seed = self.seed if self.seed != -1 else None
         state_np, info = self.env.reset(seed=fill_seed)
-        # Ensure state is tensor and on device after reset
         state = torch.tensor(np.array(state_np), dtype=torch.float32).to(self.device)
 
         steps_added = 0
@@ -275,10 +267,8 @@ class DQNAgent():
             action_vector = self.action_space[action_idx]
             next_state_np, reward, terminated, truncated, info = self.env.step(action_vector)
             done = terminated or truncated
-            # Ensure next_state is tensor and on device
             next_state = torch.tensor(np.array(next_state_np), dtype=torch.float32).to(self.device)
 
-            # Store experience (move to CPU for storage)
             s_cpu = state.cpu() if state.is_cuda else state
             ns_cpu = next_state.cpu() if next_state.is_cuda else next_state
             self.exp_replay.storeExperience(s_cpu, action_idx, reward, ns_cpu, done)
@@ -288,75 +278,64 @@ class DQNAgent():
             if done:
                 state_np, info = self.env.reset(seed=fill_seed)
                 state = torch.tensor(np.array(state_np), dtype=torch.float32).to(self.device)
-                if steps_added >= num_steps: # Exit if enough steps collected even after reset
-                     break
+                if steps_added >= num_steps: break
 
         print(f"Memory filling complete. Current size: {len(self.exp_replay)}")
 
 
     def _prepareMinibatch(self, experiences: List[Experience]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """ Converts a list of experiences into tensors for a minibatch, moving them to the agent's device. """
-        # Batch experiences
-        # Ensure states are stacked correctly (should be handled by FrameStack wrapper + tensor conversion)
         states = torch.stack([exp.state for exp in experiences]).to(self.device)
-        actions = torch.tensor([exp.action for exp in experiences], dtype=torch.long, device=self.device) # Action indices
+        actions = torch.tensor([exp.action for exp in experiences], dtype=torch.long, device=self.device)
         rewards = torch.tensor([exp.reward for exp in experiences], dtype=torch.float32, device=self.device)
         next_states = torch.stack([exp.next_state for exp in experiences]).to(self.device)
         terminals = torch.tensor([exp.terminal for exp in experiences], dtype=torch.bool, device=self.device)
-
         return states, actions, rewards, next_states, terminals
 
 
     def yj(self, tj: bool, rj: float, sj_next: torch.Tensor) -> torch.Tensor:
-        """
-        Compute y_j (target Q-value) using the standard DQN update rule for a SINGLE experience.
-        Note: This is often less efficient than batch computation in __call__.
-        """
+        """ Compute y_j (target Q-value) using the standard DQN update rule for a SINGLE experience. """
         if tj:
             return torch.tensor([rj], dtype=torch.float32, device=self.device)
         else:
             with torch.no_grad():
-                # Ensure input tensor is on the correct device and has batch dimension
                 sj_next_dev = sj_next.unsqueeze(0).to(self.device)
                 q_values_next = self.target_net(sj_next_dev)
                 max_q_next, _ = q_values_next.max(dim=1)
-                y_j = rj + self.gamma * max_q_next
+                # Apply cost penalty if enabled for single calculation (less common)
+                cost = (rj < self.cost_reward_threshold) * self.cost_penalty_coefficient if self.use_cost_penalty else 0.0
+                augmented_reward = rj - cost
+                y_j = augmented_reward + self.gamma * max_q_next
             return y_j
 
 
     def _epsilonDecay(self) -> None:
         """ Linearly anneal epsilon towards the minimum epsilon value based on episodes trained. """
-        # Decay based on current episode number
-        # Ensure episode_decay is positive
-        if self.episode_decay > 0:
-             # Linear decay from 1.0 down to self.epsilon_final over self.episode_decay episodes
-             decay_fraction = max(0.0, (self.episode_decay - self.current_episode) / self.episode_decay)
-             self.epsilon = self.epsilon_final + (1.0 - self.epsilon_final) * decay_fraction
-        else:
-             # If episode_decay is 0 or negative, just use the final epsilon
-             self.epsilon = self.epsilon_final
-
-        # Ensure epsilon doesn't go below the final value (due to float precision)
+        if self.episode_decay > 0 and self.current_episode <= self.episode_decay:
+             decay_fraction = self.current_episode / self.episode_decay
+             start_epsilon = self.params.get('epsilon', 1.0) # Get starting epsilon from params
+             self.epsilon = start_epsilon - (start_epsilon - self.epsilon_final) * decay_fraction
+        elif self.current_episode > self.episode_decay:
+             self.epsilon = self.epsilon_final # Stay at final epsilon after decay period
+        # Ensure epsilon doesn't go below the final value
         self.epsilon = max(self.epsilon_final, self.epsilon)
 
 
     def selectAction(self, state: torch.Tensor) -> int:
         """ Select an action using epsilon-greedy strategy based on the provided state. """
         if random.random() < self.epsilon:
-            # Exploration: Choose a random action index
             action_idx = random.randrange(len(self.action_space))
         else:
-            # Exploitation: Choose the best action based on the policy network
-            self.q_net.eval() # Set to evaluation mode for inference
+            self.q_net.eval()
             with torch.no_grad():
-                # Ensure state is on the correct device (should be passed from __call__)
-                q_values = self.q_net(state.unsqueeze(0)) # Add batch dimension
+                # Ensure state has batch dimension and is on correct device
+                if state.dim() == 3: # Add batch dim if missing (e.g., C, H, W)
+                     state_batch = state.unsqueeze(0).to(self.device)
+                else: # Assume already has batch dim (e.g., B, C, H, W)
+                     state_batch = state.to(self.device)
+                q_values = self.q_net(state_batch)
                 action_idx = q_values.argmax(dim=1).item()
-            self.q_net.train() # Set back to train mode
-
-        # Tracking action choice (optional, can be logged if needed)
-        # self.episode_actions[action_idx] += 1
-
+            self.q_net.train()
         return action_idx
 
 
@@ -366,79 +345,56 @@ class DQNAgent():
 
         if episode_end:
             self.current_episode += 1
-            # Reset episode-specific trackers if needed (like self.episode_actions)
-            # self.episode_actions = [0 for _ in range(len(self.action_space))]
+            # Perform epsilon decay at the end of each episode
+            self._epsilonDecay()
 
             if self.logger:
-                # Calculate and log episode summary statistics
                 try:
-                    # Check if lists are non-empty before calculating stats
                     avg_q = self.logger.averageStatistic("q_values") if self.logger.epi_stats.get("q_values") else 0.0
                     avg_ret_step = self.logger.averageStatistic("returns") if self.logger.epi_stats.get("returns") else 0.0
                     tot_ret = self.logger.sumStatistic("returns") if self.logger.epi_stats.get("returns") else 0.0
                     avg_loss = self.logger.averageStatistic("losses") if self.logger.epi_stats.get("losses") else 0.0
 
                     self.logger.setStatistic("epi_avg_q", avg_q)
-                    # self.logger.setStatistic("epi_avg_rets_step", avg_ret_step) # Avg return per step
-                    self.logger.setStatistic("epi_tot_rets", tot_ret) # Total episode return is usually more informative
+                    self.logger.setStatistic("epi_tot_rets", tot_ret)
                     self.logger.setStatistic("epi_avg_loss", avg_loss)
 
-                    # Get tiles visited from the unwrapped environment
                     try:
                          tiles = self.env.unwrapped.tile_visited_count
-                         self.logger.setStatistic("tiles_visited", tiles)
+                         self.logger.setStatistic("tiles_visited", tiles) # Log current episode tiles
                     except AttributeError:
-                         # print("Warning: env.unwrapped does not have tile_visited_count attribute.")
-                         self.logger.setStatistic("tiles_visited", 0) # Log 0 if unavailable
+                         self.logger.setStatistic("tiles_visited", 0)
 
                 except (ZeroDivisionError, KeyError, TypeError) as e:
                     print(f"Warning: Could not calculate or log episode stats: {e}")
 
-                # Clear lists for the next episode using the logger's method
-                self.logger.trackStatistic("returns", None) # Use None to clear
+                # Clear lists for the next episode
+                self.logger.trackStatistic("returns", None)
                 self.logger.trackStatistic("q_values", None)
                 self.logger.trackStatistic("losses", None)
 
-        # Log step-level stats (epsilon is updated per step via _epsilonDecay called in __call__)
+        # Log step-level stats
         if self.logger:
-            # self.logger.setStatistic("tot_steps", step=True) # This increments, use direct set
             self.logger.setStatistic("tot_steps", self.total_steps)
-            self.logger.setStatistic("eps", self.epsilon)
+            self.logger.setStatistic("eps", self.epsilon) # Log epsilon after potential decay
 
         # Track max tiles visited and update best_net
         try:
+            # Use current_tiles from episode end logging if available, otherwise get fresh
             current_tiles = self.env.unwrapped.tile_visited_count
             if current_tiles > self.max_tiles:
                 print(f"    New max tiles: {current_tiles} (Previous max: {self.max_tiles})")
                 self.max_tiles = current_tiles
-                # Update best_net weights when a new max is reached
                 self.best_net.load_state_dict(self.q_net.state_dict())
-                if self.logger:
-                    self.logger.setStatistic("tiles_visited", self.max_tiles)
-                # Optional: Save model when a new max is reached
-                # self.save_model(f"./models/saved/{self.logger.run.name}_best_tiles.pth")
+                # Log the running max tiles visited (distinct from per-episode tiles)
+                # We need a separate key for this in WandBLogger if desired, e.g., "running_max_tiles"
+                # For now, we just update self.max_tiles
         except AttributeError:
-            # If tile count isn't available, this check is skipped.
             pass
 
         return
 
-    # Optional: Add save/load methods
-    # def save_model(self, path: str):
-    #     """ Saves the policy network state dictionary. """
-    #     print(f"Saving model to {path}...")
-    #     torch.save(self.q_net.state_dict(), path)
-    #
-    # def load_model(self, path: str):
-    #     """ Loads the policy network state dictionary. """
-    #     print(f"Loading model from {path}...")
-    #     self.q_net.load_state_dict(torch.load(path, map_location=self.device))
-    #     self.target_net.load_state_dict(self.q_net.state_dict()) # Sync target net
-    #     self.best_net.load_state_dict(self.q_net.state_dict()) # Sync best net
-    #     self.q_net.eval() # Set to eval mode after loading if using for inference
-    #     self.target_net.eval()
-    #     self.best_net.eval()
-
+# ... (QNetwork and ExperienceReplay classes remain the same as the previous version) ...
 
 class QNetwork(nn.Module):
     def __init__(self, num_actions: int, input_channels: int = 4):
@@ -476,11 +432,8 @@ class QNetwork(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """ Forward pass through the network. """
-        # Ensure input is on the correct device
         x = x.to(self.device)
-        # Normalize input
         x = x / 255.0
-        # Pass through layers
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
@@ -497,33 +450,24 @@ class ExperienceReplay():
         self._replay_memory = deque(maxlen=memory_length)
         self.memory_length = memory_length
 
-
     def storeExperience(self, s0: torch.Tensor, a0: int, r0: float, s1: torch.Tensor, t: bool)->None:
         """ Store an experience tuple. Tensors should ideally be on CPU. """
-        # Ensure tensors are detached and on CPU before storing
         s0_cpu = s0.detach().cpu()
         s1_cpu = s1.detach().cpu()
         new_experience = self.Experience(s0_cpu, a0, r0, s1_cpu, t)
         self._replay_memory.append(new_experience)
         return
 
-
     def getRandomExperiences(self, batch_size: int)->List[Experience]:
         """ Return a list of 'batch_size' random experiences. """
         if batch_size > len(self._replay_memory):
              print(f"Warning: Requested batch size {batch_size} > memory size {len(self._replay_memory)}. Returning all memory.")
              return list(self._replay_memory)
-        # Use random.sample for uniform sampling
         return random.sample(self._replay_memory, batch_size)
-        # The weighted sampling below might be useful for Prioritized Experience Replay, but not standard DQN
-        # return random.choices(self._replay_memory,
-        #                     weights=[i+1 for i in range(len(self._replay_memory))],
-        #                     k=batch_size)
 
     def getCurrentExperience(self) -> Optional[Experience]:
         """ Returns the most recently added experience, if any. """
-        if not self._replay_memory:
-            return None
+        if not self._replay_memory: return None
         return self._replay_memory[-1]
 
     def getCapacity(self) -> float:
@@ -537,3 +481,4 @@ class ExperienceReplay():
     def __len__(self) -> int:
         """ Returns the current number of experiences stored. """
         return len(self._replay_memory)
+

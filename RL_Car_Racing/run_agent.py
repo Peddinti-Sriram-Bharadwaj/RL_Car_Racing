@@ -31,7 +31,7 @@ def run_demonstration(model_path: str, num_episodes: int = 1, agent_type: str = 
     # --- Environment Setup ---
     # Use render_mode='human' to see the window
     # Use continuous=True as the agent/action space expects it
-    env_raw = gym.make("CarRacing-v2", render_mode='human', continuous=True)
+    env_raw = gym.make("CarRacing-v3", render_mode='human', continuous=True)
 
     # Apply the same wrappers used during training/data collection
     # Pass dummy experiment details, disable recording

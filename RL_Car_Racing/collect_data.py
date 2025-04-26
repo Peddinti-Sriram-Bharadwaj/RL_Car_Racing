@@ -1,13 +1,13 @@
 # /Users/srirambharadwaj/Documents/iiitb/sem2/RL/RL_Car_Racing/RL_Car_Racing/collect_data.py
 import gymnasium as gym
 import numpy as np
-# import keyboard  # Remove keyboard import
-from pynput import keyboard # Import pynput instead
+from pynput import keyboard # Using pynput
 import time
 import pickle
 import os
 import torch
-import threading # Needed for the listener
+import threading
+import sys # Added for sys.exit
 
 # --- Important: Make sure these match your dqn.py and utils.py ---
 from RL_Car_Racing.models.dqn import ACTION_SPACE
@@ -16,13 +16,10 @@ from RL_Car_Racing.utils import wrap_env
 
 # --- Configuration ---
 OUTPUT_FILENAME = "human_demonstrations.pkl"
-ENV_ID = "CarRacing-v3" # Changed back to v2 for consistency
+ENV_ID = "CarRacing-v3" # Keep consistent
 # --- Configuration ---
 
 # --- Key Mapping (Using pynput Key objects and characters) ---
-# Note: pynput uses specific objects for special keys (Key.up, Key.space)
-# and character strings for regular keys ('w', 'a', 's', 'd').
-
 key_to_action_idx = {
     keyboard.Key.up: 0,      # Strong Gas
     'w': 1,                  # Medium Gas
@@ -40,60 +37,43 @@ QUIT_KEY = keyboard.Key.esc # Use Escape key to quit
 
 # --- Global state for pressed keys and quit flag ---
 pressed_keys = set()
-quit_flag = threading.Event() # Use an Event for thread-safe quitting
+quit_flag = threading.Event()
 listener_thread = None
 # --- Global state ---
 
-# --- pynput Listener Callbacks ---
+# --- pynput Listener Callbacks (on_press, on_release) ---
+# (Keep these functions as they were)
 def on_press(key):
-    """Callback function for key press events."""
     global pressed_keys
     try:
-        # Check if it's a character key or special key
         key_val = key.char if hasattr(key, 'char') else key
         if key_val in key_to_action_idx or key == QUIT_KEY:
             pressed_keys.add(key_val)
-            # print(f"Pressed: {key_val}, Current set: {pressed_keys}") # Debug print
-    except AttributeError:
-        # Ignore keys that don't have a char attribute (like Shift, Ctrl) if not mapped
-        pass
+    except AttributeError: pass
     if key == QUIT_KEY:
-        print("Quit key pressed!")
-        quit_flag.set() # Signal the main thread to quit
-        return False # Stop the listener
+        print("\nQuit key pressed!")
+        quit_flag.set()
+        return False
 
 def on_release(key):
-    """Callback function for key release events."""
     global pressed_keys
     try:
         key_val = key.char if hasattr(key, 'char') else key
         if key_val in pressed_keys:
             pressed_keys.remove(key_val)
-            # print(f"Released: {key_val}, Current set: {pressed_keys}") # Debug print
-    except (AttributeError, KeyError):
-        pass # Ignore if key wasn't tracked or doesn't have char
-
+    except (AttributeError, KeyError): pass
 # --- pynput Listener Callbacks ---
 
-
+# --- get_human_action_idx, start_listener, stop_listener ---
+# (Keep these functions as they were)
 def get_human_action_idx():
-    """Checks the global set of pressed keys and returns the corresponding action index."""
     global pressed_keys
     current_pressed_indices = []
-
-    # Check the currently pressed keys against our mapping
-    # Need to iterate through the mapping, not the pressed_keys set directly
-    # because the set might contain keys not in our mapping (like Shift)
     for key_val, action_idx in key_to_action_idx.items():
-         if key_val in pressed_keys:
-              current_pressed_indices.append(action_idx)
-
-    if not current_pressed_indices:
-        return 9 # Default to "Do Nothing"
-    elif len(current_pressed_indices) == 1:
-        return current_pressed_indices[0]
-    else:
-        # Handle multiple key presses (same priority logic as before)
+         if key_val in pressed_keys: current_pressed_indices.append(action_idx)
+    if not current_pressed_indices: return 9
+    elif len(current_pressed_indices) == 1: return current_pressed_indices[0]
+    else: # Handle multiple key presses
         if 3 in current_pressed_indices: return 3
         if 4 in current_pressed_indices: return 4
         if 5 in current_pressed_indices: return 5
@@ -103,60 +83,64 @@ def get_human_action_idx():
         if 2 in current_pressed_indices: return 2
         return current_pressed_indices[0]
 
-
 def start_listener():
-    """Starts the pynput keyboard listener in a separate thread."""
     global listener_thread
-    # Setup the listener (non-blocking)
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener_thread = threading.Thread(target=listener.start, daemon=True)
     listener_thread.start()
     print("Keyboard listener started.")
 
 def stop_listener():
-    """Stops the pynput keyboard listener."""
     global listener_thread
-    # The listener stops itself when QUIT_KEY is pressed (on_press returns False)
-    # We just need to wait for the thread to finish if it was started
     if listener_thread and listener_thread.is_alive():
          print("Waiting for listener thread to stop...")
-         listener_thread.join(timeout=1.0) # Wait briefly
+         listener_thread.join(timeout=1.0)
     print("Keyboard listener stopped.")
+# --- get_human_action_idx, start_listener, stop_listener ---
 
 
-def collect_demonstrations(num_episodes=5):
-    """Runs the environment interactively and collects human demonstrations."""
+def collect_demonstrations(num_episodes_to_save=5): # Renamed parameter
+    """Runs the environment interactively and collects human demonstrations, asking for confirmation."""
+
     print("\n--- Starting Human Demonstration Collection ---")
     print("Controls:")
     for key, idx in key_to_action_idx.items():
         key_name = key if isinstance(key, str) else key.name.upper()
         print(f"  {key_name.upper()}: Action {idx} -> {ACTION_SPACE[idx]}")
     print("  No Key Press: Action 9 -> [0. 0. 0.]")
-    print(f"\nPress '{QUIT_KEY.name.upper()}' to quit early.") # Use QUIT_KEY name
+    print(f"\nPress '{QUIT_KEY.name.upper()}' during an episode to quit the collection process.")
     print("-----------------------------------------------\n")
 
-    start_listener() # Start listening for keys
+    start_listener()
 
     env_raw = gym.make(ENV_ID, render_mode='human', continuous=True)
     dummy_experiment = {'name': 'data_collection', 'record_video': -1}
     env = wrap_env(env_raw, dummy_experiment['name'], record_t=-1)
 
-    demonstrations = []
+    all_saved_demonstrations = []
+    saved_episodes_count = 0
+    attempt_count = 0
     start_skip = 50
 
-    try: # Use try...finally to ensure listener stops
-        for episode in range(num_episodes):
-            if quit_flag.is_set(): break # Check if quit was signalled
+    try:
+        # Loop until the desired number of episodes are SAVED
+        while saved_episodes_count < num_episodes_to_save:
+            if quit_flag.is_set():
+                print("\nQuit signal received before starting new episode.")
+                break
 
-            print(f"Starting Episode {episode + 1}/{num_episodes}")
+            attempt_count += 1
+            print(f"\n--- Starting attempt {attempt_count} (Aiming for saved episode {saved_episodes_count + 1}/{num_episodes_to_save}) ---")
             state, info = env.reset()
             terminated = truncated = False
             step = 0
+            current_episode_data = [] # Store data for this attempt
 
+            # --- Run one episode attempt ---
             while not (terminated or truncated):
-                if quit_flag.is_set(): # Check frequently within the episode
-                    print("Quitting data collection...")
-                    break
+                if quit_flag.is_set():
+                    print("\nQuit signal received mid-episode.")
+                    break # Exit inner loop
 
                 action_idx = get_human_action_idx()
                 action_vector = ACTION_SPACE[action_idx]
@@ -166,34 +150,112 @@ def collect_demonstrations(num_episodes=5):
 
                 if step > start_skip:
                     state_cpu = state.cpu() if isinstance(state, torch.Tensor) and state.is_cuda else state
-                    demonstrations.append((state_cpu, action_idx))
+                    current_episode_data.append((state_cpu, action_idx))
 
                 state = next_state
-                time.sleep(0.02) # Keep the small delay
+                time.sleep(0.02)
+            # --- End of episode attempt ---
 
-            if quit_flag.is_set(): break # Exit outer loop if quit signal received
-            print(f"Episode {episode + 1} finished. Total demonstrations collected: {len(demonstrations)}")
+            # If quit signal received during episode, break outer loop too
+            if quit_flag.is_set():
+                break
 
-    finally: # Ensure cleanup happens
-        print("Closing environment...")
+            # --- Ask for confirmation ---
+            print(f"--- Attempt {attempt_count} finished. Steps recorded: {len(current_episode_data)} ---")
+            while True:
+                save_choice = input("Save this episode? (y/n): ").strip().lower()
+                if save_choice == 'y':
+                    all_saved_demonstrations.extend(current_episode_data)
+                    saved_episodes_count += 1
+                    print(f"Episode saved. ({saved_episodes_count}/{num_episodes_to_save} saved)")
+                    break
+                elif save_choice == 'n':
+                    print("Episode discarded.")
+                    break
+                else:
+                    print("Invalid input. Please enter 'y' or 'n'.")
+            # --- End of confirmation ---
+
+    finally:
+        print("\nClosing environment...")
         env.close()
-        stop_listener() # Stop the listener thread
+        stop_listener()
 
-    return demonstrations
+    print(f"\n--- Collection Finished ---")
+    print(f"Total episodes saved: {saved_episodes_count}")
+    print(f"Total demonstrations saved: {len(all_saved_demonstrations)}")
+    return all_saved_demonstrations
+
 
 if __name__ == "__main__":
     print("Ensure the terminal or the game window has focus to capture keys...")
-    # No need for extra sleep, listener starts immediately
 
-    collected_data = collect_demonstrations(num_episodes=10)
+    existing_data = []
+    mode = ''
+    num_episodes_to_save = 10 # Default value
 
-    if collected_data:
-        output_dir = os.path.dirname(OUTPUT_FILENAME)
-        if output_dir and not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        with open(OUTPUT_FILENAME, 'wb') as f:
-            pickle.dump(collected_data, f)
-        print(f"\nSuccessfully saved {len(collected_data)} state-action pairs to {OUTPUT_FILENAME}")
+    # --- Ask user whether to overwrite or append ---
+    if os.path.exists(OUTPUT_FILENAME):
+        while True:
+            print(f"\nExisting demonstration file found: '{OUTPUT_FILENAME}'")
+            print("  1: Overwrite existing file and start fresh.")
+            print("  2: Append new demonstrations to the existing file.")
+            choice = input("Enter choice (1 or 2): ").strip()
+            if choice == '1':
+                print("Selected: Overwrite existing demonstrations.")
+                mode = 'overwrite'
+                break
+            elif choice == '2':
+                print("Selected: Append to existing demonstrations.")
+                mode = 'append'
+                try:
+                    with open(OUTPUT_FILENAME, 'rb') as f:
+                        existing_data = pickle.load(f)
+                    print(f"Loaded {len(existing_data)} existing demonstrations.")
+                except Exception as e:
+                    print(f"Error loading existing demonstrations: {e}. Starting fresh instead.")
+                    existing_data = []
+                break
+            else:
+                print("Invalid choice. Please enter 1 or 2.")
     else:
-        print("\nNo data collected or collection quit early.")
+        print(f"No existing demonstration file found. Starting fresh.")
+        mode = 'overwrite'
+    # --- Ask user whether to overwrite or append ---
+
+    # --- Ask user how many episodes to SAVE ---
+    while True:
+        try:
+            num_str = input(f"How many episodes do you want to SAVE this session? (default: {num_episodes_to_save}): ").strip()
+            if not num_str: break
+            num_episodes_to_save = int(num_str)
+            if num_episodes_to_save > 0: break
+            else: print("Please enter a positive number of episodes.")
+        except ValueError: print("Invalid input. Please enter a number.")
+    # --- Ask user how many episodes to SAVE ---
+
+
+    # Collect new data, asking for confirmation after each episode attempt
+    newly_collected_data = collect_demonstrations(num_episodes_to_save=num_episodes_to_save)
+
+    # Combine data if appending
+    if mode == 'append':
+        final_data = existing_data + newly_collected_data
+        print(f"Appended {len(newly_collected_data)} new demonstrations to existing data.")
+    else: # Overwrite mode or starting fresh
+        final_data = newly_collected_data
+
+    # Save the final data
+    if final_data:
+        output_dir = os.path.dirname(OUTPUT_FILENAME)
+        if output_dir and not os.path.exists(output_dir): os.makedirs(output_dir)
+        try:
+            with open(OUTPUT_FILENAME, 'wb') as f: pickle.dump(final_data, f)
+            print(f"\nSuccessfully saved {len(final_data)} total state-action pairs to {OUTPUT_FILENAME}")
+        except Exception as e: print(f"\nError saving demonstrations: {e}")
+    elif mode == 'overwrite' and os.path.exists(OUTPUT_FILENAME):
+         print("\nNo new data collected/saved in overwrite mode. Removing existing file.")
+         os.remove(OUTPUT_FILENAME)
+    else:
+        print("\nNo data collected or saved.")
 
